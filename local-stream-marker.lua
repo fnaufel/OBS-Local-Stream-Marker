@@ -723,7 +723,7 @@ end
 
 function script_description()
 	return [[
-<h2>Local Stream Marker v1.11</h2>
+<h2>Local Stream Marker v1.12</h2>
 <p>Use hotkeys to create markers on your stream or recording!</p>
 <p>Go to <strong>Settings > Hotkeys</strong> and look for "<strong>[Local Stream Marker] Add stream mark</strong>" to set your hotkey.</p>
 <p>Visit the documentation for more info: <a href="https://github.com/honganqi/OBS-Local-Stream-Marker">github.com/honganqi/OBS-Local-Stream-Marker</a></p>
