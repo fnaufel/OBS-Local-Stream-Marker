@@ -1,6 +1,8 @@
--- Local Stream Marker v1.12
+-- Local Stream Marker v1.13
 
--- initialize functions with local scope, duh
+-----== INITIALIZE VARIABLES ==-----
+-- initialize functions with local scope so they don't conflict with other scripts
+
 -- OBS stuff
 local obs 								= obslua
 local script_settings					= nil
@@ -21,7 +23,7 @@ local preset_file_extension				= ".markerpresets"
 
 -- CSV stuff
 local csv_headers 						= "Date Time, Stream Start, Stream Timestamp, Stream End Mark Timestamp, Recording Full Path, Recording Filename, Recording Timestamp, Recording End Mark Timestamp, Recording Timestamp on File, Recording End Mark Timestamp on File, Comment";
-local output_format 					= "$current_time, $stream_start_time, $stream_timestamp, $stream_mark_end_timestamp, $recording_path, $recording_filename, $recording_timestamp, $recording_mark_end_timestamp, $recording_file_timestamp, $recording_file_mark_end_timestamp, $comment";
+local output_format 					= "$current_time, $stream_start_time_csv, $stream_timestamp, $stream_mark_end_timestamp, $recording_path, $recording_filename, $recording_timestamp, $recording_mark_end_timestamp, $recording_file_timestamp, $recording_file_mark_end_timestamp, $comment";
 local recording_path					= "";
 local recording_filename 				= "";
 
@@ -32,9 +34,11 @@ local recording_timestamp 				= "n/a";
 local recording_mark_end_timestamp		= "n/a";
 local recording_file_timestamp 			= "n/a";
 local recording_file_mark_end_timestamp = "n/a";
-local recording_file_frame_count 		= 0
-local recording_frame_count_on_split 	= 0
-local stream_start_time 				= "n/a";
+local recording_file_elapsed_time_sec 	= 0
+local stream_start_time_csv				= "n/a";
+local stream_start_time 				= nil;
+local recording_start_time				= nil;
+local recording_file_start_time			= nil;
 
 -- hotkey stuff
 local marker_hotkey_id 					= obs.OBS_INVALID_HOTKEY_ID
@@ -48,32 +52,28 @@ local active_comment					= ""
 local preset_filenames					= {}
 
 -- video info stuff
-local video_info 						= nil
-local framerate 						= 30
 local stream_output 					= nil
 local recording_output 					= nil
 local signal_handler 					= nil
-local last_recording_frame_count		= 0
-local last_stream_frame_count			= 0
 
 -- functions and all that
 local update_output_path
 local read_local_stream_marker_csv_file
 local read_all_lines
 local write_all_lines
-local file_exists
+local folder_exists
 local set_filename
 local get_filename_from_path
 local sanitize_filename
-local replaceTrashyText
+local sanitize_date_format
 local string_to_csv_row
 local hotkey_pressed
 local hotkey_end_pressed
 local mark_stream
 local mark_end_stream
 local on_event
-local get_framerate
 local update_ui_on_comments
+local update_ui_on_custom_filename
 local get_all_comment_preset_files
 local save_preset_file
 local read_preset_file
@@ -98,10 +98,11 @@ update_output_path = function()
 	output_path = script_path() .. output_file_name_actual;
 
 	-- if specified output path exists, then set this as the new output path
-	if (output_folder ~= "" and file_exists(output_folder)) then
+	if (output_folder ~= "" and folder_exists(output_folder)) then
 		output_path = output_folder .. "/" .. output_file_name_actual
 	end
 end
+
 
 read_local_stream_marker_csv_file = function()
 	update_output_path()
@@ -133,7 +134,7 @@ write_all_lines = function(path, lines)
 end
 
 
-file_exists = function(path)
+folder_exists = function(path)
 	local ok, err, code = os.rename(path, path)
 	if not ok then
 		if code == 13 then
@@ -157,9 +158,10 @@ set_filename = function(current_filename)
 			-- 5. Set filename to the current filename (e.g. current date/time)
 			-- 6. If set to reset date/time in filename, proceed to reset the filename
 			if reset_custom_filename then
-				local date_string = os.date(output_datetime_format)
-				local escaped_date_death = replaceTrashyText(date_string)
-				filename = filename:gsub("%[date%]", date_string):gsub("[^%w%-_ ]", "-")
+				local date_format = sanitize_date_format(output_datetime_format)
+				local date_string = os.date(date_format)
+				local escaped_date_death = sanitize_filename(date_string)
+				filename = filename:gsub("%[date%]", escaped_date_death):gsub("[^%w%-_ ]", "-")
 			else
 				filename = current_filename
 			end
@@ -172,7 +174,7 @@ end
 
 
 get_filename_from_path = function(path)
-	return path:match("^.+/(.+)$")
+	return path:match("^.+[\\/](.+)$")
 end
 
 
@@ -207,8 +209,8 @@ sanitize_filename = function(name)
 end
 
 
-replaceTrashyText = function(str)
-    return str:gsub("[%-%.%+%[%]%(%)%$%^%%%?%*]", "%%%1")
+function sanitize_date_format(str)
+    return str:gsub("(%-%.%+%[%]%(%)%$%^%%%?%*)", "%%%1")
 end
 
 
@@ -216,7 +218,7 @@ string_to_csv_row = function(text_to_process)
 	local processed = text_to_process;
 
 	processed = processed:gsub("$current_time", os.date("%Y-%m-%d %X"));
-	processed = processed:gsub("$stream_start_time", stream_start_time);
+	processed = processed:gsub("$stream_start_time_csv", stream_start_time_csv);
 	processed = processed:gsub("$stream_timestamp", stream_timestamp);
 	processed = processed:gsub("$stream_mark_end_timestamp", stream_mark_end_timestamp);
 	processed = processed:gsub("$recording_path", recording_path);
@@ -233,7 +235,7 @@ end
 
 print_log = function(message)
 	if show_log then
-		print("[Local Stream Marker] " .. message)
+		print("[Local Stream Marker] " .. tostring(message))
 	end
 end
 
@@ -269,16 +271,13 @@ mark_stream = function(active_comment)
 	if obs.obs_frontend_streaming_active() then
 		-- double-check stream output
 		if stream_output ~= nil then
-			local stream_frame_count = obs.obs_output_get_total_frames(stream_output);
-			last_stream_frame_count = stream_frame_count
-			stream_elapsed_time_sec = stream_frame_count / framerate
+			stream_elapsed_time_sec = os.time() - stream_start_time
 		end
 
 		-- get streaming timestamp
-		local stream_elapsed_hour = string.format("%02d", math.floor(stream_elapsed_time_sec / 3600));
-		local stream_elapsed_minute = string.format("%02d", math.floor((stream_elapsed_time_sec % 3600) / 60));
-		local stream_elapsed_second = string.format("%02d", math.floor(stream_elapsed_time_sec % 60));
-		stream_timestamp = string.format("%s:%s:%s", stream_elapsed_hour, stream_elapsed_minute, stream_elapsed_second);
+		-- the "!" in the datetime format is to set this value to UTC to eliminate timezone issues
+		-- reset to epoch time: seconds since 1970-01-01 00:00:00
+		stream_timestamp = os.date("!%H:%M:%S", stream_elapsed_time_sec)
 		stream_mark_end_timestamp = "n/a";
 	else
 		stream_timestamp = "n/a";
@@ -288,25 +287,20 @@ mark_stream = function(active_comment)
 	if obs.obs_frontend_recording_active() then
 		-- double-check recording output
 		if recording_output ~= nil then
-			local recording_frame_count = obs.obs_output_get_total_frames(recording_output);
-			last_recording_frame_count = recording_frame_count
-			recording_file_frame_count = recording_frame_count - recording_frame_count_on_split
-			recording_elapsed_time_sec = recording_frame_count / framerate
-			recording_file_elapsed_time_sec = recording_file_frame_count / framerate
+			recording_elapsed_time_sec = os.time() - recording_start_time
+			recording_file_elapsed_time_sec = os.time() - recording_file_start_time
 		end
 
 		-- get recording timestamp
-		local recording_elapsed_hour = string.format("%02d", math.floor(recording_elapsed_time_sec / 3600));
-		local recording_elapsed_minute = string.format("%02d", math.floor((recording_elapsed_time_sec % 3600) / 60));
-		local recording_elapsed_second = string.format("%02d", math.floor(recording_elapsed_time_sec % 60));
-		recording_timestamp = string.format("%s:%s:%s", recording_elapsed_hour, recording_elapsed_minute, recording_elapsed_second);
+		-- the "!" in the datetime format is to set this value to UTC to eliminate timezone issues
+		-- reset to epoch time: seconds since 1970-01-01 00:00:00
+		recording_timestamp = os.date("!%H:%M:%S", recording_elapsed_time_sec)
 		recording_mark_end_timestamp = "n/a";
 
 		-- get recording FILE timestamp (will differ from above if Automatic File Splitting is enabled)
-		local recording_file_elapsed_hour = string.format("%02d", math.floor(recording_file_elapsed_time_sec / 3600));
-		local recording_file_elapsed_minute = string.format("%02d", math.floor((recording_file_elapsed_time_sec % 3600) / 60));
-		local recording_file_elapsed_second = string.format("%02d", math.floor(recording_file_elapsed_time_sec % 60));
-		recording_file_timestamp = string.format("%s:%s:%s", recording_file_elapsed_hour, recording_file_elapsed_minute, recording_file_elapsed_second);
+		-- the "!" in the datetime format is to set this value to UTC to eliminate timezone issues
+		-- reset to epoch time: seconds since 1970-01-01 00:00:00
+		recording_file_timestamp = os.date("!%H:%M:%S", recording_file_elapsed_time_sec)
 		recording_file_mark_end_timestamp = "n/a";
 	else
 		recording_timestamp = "n/a";
@@ -317,11 +311,11 @@ mark_stream = function(active_comment)
 	-- comment section
 	active_comment = active_comment or ""
 
-	local lines = read_all_lines(output_path)
+	local lines = read_all_lines()
 
 	-- insert column headers if empty
 	if #lines == 0 then
-		table.insert(lines, output_format_header)
+		table.insert(lines, csv_headers)
 	end
 
 	-- get formatted variables into a line
@@ -348,38 +342,26 @@ mark_end_stream = function(active_comment)
 	if obs.obs_frontend_streaming_active() then
 		-- double-check stream output
 		if stream_output ~= nil then
-			local stream_frame_count = obs.obs_output_get_total_frames(stream_output);
-			stream_elapsed_time_sec = stream_frame_count / framerate
+			stream_elapsed_time_sec = os.time() - stream_start_time
 		end
 
 		-- get streaming timestamp
-		local stream_elapsed_hour = string.format("%02d", math.floor(stream_elapsed_time_sec / 3600));
-		local stream_elapsed_minute = string.format("%02d", math.floor((stream_elapsed_time_sec % 3600) / 60));
-		local stream_elapsed_second = string.format("%02d", math.floor(stream_elapsed_time_sec % 60));
-		stream_mark_end_timestamp = string.format("%s:%s:%s", stream_elapsed_hour, stream_elapsed_minute, stream_elapsed_second);
+		stream_mark_end_timestamp = os.date("!%H:%M:%S", stream_elapsed_time_sec)
 	end
 
 	-- if recording
 	if obs.obs_frontend_recording_active() then
 		-- double-check recording output
 		if recording_output ~= nil then
-			local recording_frame_count = obs.obs_output_get_total_frames(recording_output);
-			recording_file_frame_count = recording_frame_count - recording_frame_count_on_split
-			recording_elapsed_time_sec = recording_frame_count / framerate
-			recording_file_elapsed_time_sec = recording_file_frame_count / framerate
+			recording_elapsed_time_sec = os.time() - recording_start_time
+			recording_file_elapsed_time_sec = os.time() - recording_file_start_time
 		end
 
 		-- get recording timestamp
-		local recording_elapsed_hour = string.format("%02d", math.floor(recording_elapsed_time_sec / 3600));
-		local recording_elapsed_minute = string.format("%02d", math.floor((recording_elapsed_time_sec % 3600) / 60));
-		local recording_elapsed_second = string.format("%02d", math.floor(recording_elapsed_time_sec % 60));
-		recording_mark_end_timestamp = string.format("%s:%s:%s", recording_elapsed_hour, recording_elapsed_minute, recording_elapsed_second);
+		recording_mark_end_timestamp = os.date("!%H:%M:%S", recording_elapsed_time_sec);
 
 		-- get recording FILE timestamp (will differ from above if Automatic File Splitting is enabled)
-		local recording_file_elapsed_hour = string.format("%02d", math.floor(recording_file_elapsed_time_sec / 3600));
-		local recording_file_elapsed_minute = string.format("%02d", math.floor((recording_file_elapsed_time_sec % 3600) / 60));
-		local recording_file_elapsed_second = string.format("%02d", math.floor(recording_file_elapsed_time_sec % 60));
-		recording_file_mark_end_timestamp = string.format("%s:%s:%s", recording_file_elapsed_hour, recording_file_elapsed_minute, recording_file_elapsed_second);
+		recording_file_mark_end_timestamp = os.date("!%H:%M:%S", recording_file_elapsed_time_sec)
 	end
 
 
@@ -395,7 +377,7 @@ mark_end_stream = function(active_comment)
 	-- remove the latest marker for the associated commented marker
 	local row_index = table.remove(queue)
 
-	local lines = read_all_lines(output_path)
+	local lines = read_all_lines()
 	if not lines[row_index] then return end
 
 	-- parse fields (safe because we only modify known columns)
@@ -409,7 +391,7 @@ mark_end_stream = function(active_comment)
 	fields[8]  = recording_mark_end_timestamp
 	fields[10] = recording_file_mark_end_timestamp
 
-	lines[row_index] = table.concat(fields, ", ")
+	lines[row_index] = table.concat(fields, ",")
 	write_all_lines(output_path, lines)
 
 	print_log("END '" .. tostring(active_comment) .. "' → row " .. row_index)
@@ -420,9 +402,9 @@ end
 on_event = function(event)
 	if event == obs.OBS_FRONTEND_EVENT_STREAMING_STARTED then
 		stream_output = obs.obs_frontend_get_streaming_output();
-		stream_start_time = os.date("%Y-%m-%d %X");
+		stream_start_time = os.time()
+		stream_start_time_csv = os.date("%Y-%m-%d %X", stream_start_time);
 		stream_timestamp = "00:00:00";
-		get_framerate()
 		if not reset_custom_filename then
 			reset_custom_filename = true;
 		end
@@ -431,8 +413,9 @@ on_event = function(event)
 	
 	if event == obs.OBS_FRONTEND_EVENT_RECORDING_STARTED then
 		recording_output = obs.obs_frontend_get_recording_output();
+		recording_file_start_time = os.time();
+		recording_start_time = os.time();
 		recording_timestamp = "00:00:00";
-		get_framerate()
 		if not obs.obs_frontend_streaming_active() and not reset_custom_filename then
 			reset_custom_filename = true;
 		end
@@ -445,9 +428,10 @@ on_event = function(event)
 
 	if event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED then
 		recording_output = nil
-		recording_frame_count_on_split = 0
+		recording_file_elapsed_time_sec = 0
 		obs.obs_data_release(output_settings)
 		obs.obs_output_release(recording_output)
+		obs.signal_handler_disconnect(signal_handler, "file_changed")
 	else
 		-- check if recording was split, get new name and reset timestamp
 		-- credits to koala and upgradeQ in the OBS Forum for this (https://obsproject.com/forum/threads/failed-to-accomplish-work-with-lua-scripting.158774/)
@@ -475,7 +459,8 @@ on_event = function(event)
 			signal_handler = obs.obs_output_get_signal_handler(recording_output)
 			obs.signal_handler_connect(signal_handler, "file_changed", function(calldata)
 				recording_path = obs.calldata_string(calldata, "next_file")
-				recording_frame_count_on_split = obs.obs_output_get_total_frames(recording_output);
+				recording_filename = get_filename_from_path(recording_path)
+				recording_file_start_time = os.time()
 			end)
 			recording_filename = get_filename_from_path(recording_path)
 		end
@@ -483,11 +468,12 @@ on_event = function(event)
 end
 
 
-get_framerate = function()
-	video_info = obs.obs_video_info()
-	if obs.obs_get_video_info(video_info) then
-		framerate = video_info.fps_num / video_info.fps_den
-	end
+update_ui_on_custom_filename = function(props)
+	local show_custom_filename_properties = use_custom_filename
+	local custom_filename_property = obs.obs_properties_get(props, "output_file_name_custom")
+	local datetime_format_property = obs.obs_properties_get(props, "output_datetime_format")
+	obs.obs_property_set_visible(custom_filename_property, show_custom_filename_properties)
+	obs.obs_property_set_visible(datetime_format_property, show_custom_filename_properties)
 end
 
 
@@ -557,7 +543,7 @@ end
 
 
 get_all_comment_preset_files = function()
-	print_log("--- Searching for comment preset files in: " .. script_path() .. " ---")
+	print_log("--- Searching for comment preset files in: " .. output_folder .. " ---")
 	preset_filenames = {}
 
 	update_output_path()
@@ -573,8 +559,10 @@ get_all_comment_preset_files = function()
 					-- Check if the file extension matches the desired type
 					if obs.os_get_path_extension(entry.d_name) == preset_file_extension then
 						local file_contents = read_preset_file(output_folder .. "/" .. entry.d_name)
-						preset_filenames[file_contents[1]] = entry.d_name
-						print_log("Found comment preset file: " .. entry.d_name)
+						if file_contents[1] ~= nil then
+							preset_filenames[file_contents[1]] = entry.d_name
+							print_log("Found comment preset file: " .. entry.d_name)							
+						end
 					end					
                 end
             end
@@ -675,10 +663,10 @@ function script_properties()
 
 	local directory_property = obs.obs_properties_add_path(properties, "output_folder", "Output Folder", obs.OBS_PATH_DIRECTORY, nil, nil)
 	obs.obs_property_set_long_description(directory_property, "The path where you want the output file (CSV) to be created.\n\nIf this is not specified or if there is an error in writing to this folder, the CSV file will be saved in the same folder as the script.");
-	obs.obs_properties_add_button(properties, "mark_stream", " Set Marker ", mark_stream)
+	obs.obs_properties_add_button(properties, "mark_stream", " Set Marker (test)", mark_stream)
 
 	-- datetime formats from https://www.lua.org/pil/22.1.html
-	local datetime_formats = "    %a	abbreviated weekday name (e.g., Wed)\
+	local datetime_formats = "	%a	abbreviated weekday name (e.g., Wed)\
 	%A	full weekday name (e.g., Wednesday)\
 	%b	abbreviated month name (e.g., Sep)\
 	%B	full month name (e.g., September)\
@@ -696,12 +684,21 @@ function script_properties()
 	%Y	full year (1998)\
 	%y	two-digit year (98) [00-99]\
 	%%	the character `%´";
-	obs.obs_properties_add_bool(properties, "output_use_custom_filename", "Use custom filename")
-	obs.obs_properties_add_bool(properties, "show_log", "Show debug log")
+
+	local use_custom_filename_property = obs.obs_properties_add_bool(properties, "use_custom_filename", "Use custom filename")
 	local custom_filename_property = obs.obs_properties_add_text(properties, "output_file_name_custom", "CSV Filename", obs.OBS_TEXT_DEFAULT)
 	obs.obs_property_set_long_description(custom_filename_property, "If left blank, CSV file will be named \"obs-local-stream-marker.csv\"\n" .. datetime_formats);
 	local datetime_format_property = obs.obs_properties_add_text(properties, "output_datetime_format", "Datetime Format", obs.OBS_TEXT_DEFAULT)
-	obs.obs_property_set_long_description(datetime_format_property, "To use this, add [date] to the custom filename\nDo NOT \n" .. datetime_formats);
+	obs.obs_property_set_long_description(datetime_format_property, "To use this, add [date] to the custom filename. Do NOT change this while a stream or recording is ongoing.\n\n" .. datetime_formats);
+
+	obs.obs_property_set_modified_callback(use_custom_filename_property, function(props, property, settings)
+		update_ui_on_custom_filename(props)
+		return true
+	end)
+
+	update_ui_on_custom_filename(properties)
+
+	obs.obs_properties_add_bool(properties, "show_log", "Show debug log")
 
 	obs.obs_properties_add_text(properties, "spacer_1", " ", obs.OBS_TEXT_INFO)
 
@@ -723,7 +720,7 @@ end
 
 function script_description()
 	return [[
-<h2>Local Stream Marker v1.12</h2>
+<h2>Local Stream Marker v1.13</h2>
 <p>Use hotkeys to create markers on your stream or recording!</p>
 <p>Go to <strong>Settings > Hotkeys</strong> and look for "<strong>[Local Stream Marker] Add stream mark</strong>" to set your hotkey.</p>
 <p>Visit the documentation for more info: <a href="https://github.com/honganqi/OBS-Local-Stream-Marker">github.com/honganqi/OBS-Local-Stream-Marker</a></p>
@@ -742,11 +739,10 @@ end
 
 function script_update(settings)
 	output_folder = obs.obs_data_get_string(settings, "output_folder")
+	use_custom_filename = obs.obs_data_get_bool(settings, "use_custom_filename")
 	output_file_name_custom = obs.obs_data_get_string(settings, "output_file_name_custom")
-	use_custom_filename = obs.obs_data_get_bool(settings, "output_use_custom_filename")
 	show_log = obs.obs_data_get_bool(settings, "show_log")
 	output_datetime_format = obs.obs_data_get_string(settings, "output_datetime_format")
-	get_framerate()
 
 	-- convert Windows path to UNIX path
 	output_folder = output_folder:gsub([[\]], "/");
@@ -768,7 +764,7 @@ end
 
 function script_defaults(settings)
 	obs.obs_data_set_default_string(settings, "output_file_name_custom", output_file_name_custom)
-	obs.obs_data_set_default_bool(settings, "output_use_custom_filename", false)
+	obs.obs_data_set_default_bool(settings, "use_custom_filename", false)
 	obs.obs_data_set_default_bool(settings, "show_log", false)
 	obs.obs_data_set_default_string(settings, "output_datetime_format", output_datetime_format)
 	obs.obs_data_set_default_bool(settings, "comments_enabled", false)

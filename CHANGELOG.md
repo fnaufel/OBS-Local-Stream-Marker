@@ -2,6 +2,13 @@
 All notable changes to this project will be documented in
 this file.
 
+## 1.13 - 2026/06/14 04:29 GMT+08:00
+### Fixed
+* Restored the CSV column headers - lost them a few versions back
+* Timestamps are way more accurate now by using `os.time()` (I don't remember why I had to do acrobatics involving the time and framecount)
+* Got rid of everything related to frame count and framerate
+* Cleaned up unused variables
+
 ## 1.12 - 2026/01/17 02:37 GMT+08:00
 ### Fixed
 * Fixed a bug which broke the script on load caused by an unknown variable from an unclean cleanup (thank you Piksure for reporting it, and thank you firefoxcodes for sending the PR to fix it!)
