@@ -71,6 +71,8 @@ You can add predefined comments and assign them to markers which you can then ad
 ## Notes
 1. Make sure that your CSV file is not open in a spreadsheet app so the script can write to it.
 2. The "Recording Timestamp on File" column will differ from the "Recording Timestamp" column only when the recording is split using Automatic File Splitting.
+3. Recording timestamps exclude time spent paused. A marker placed during a recording pause uses the last recorded position, while the stream timestamp continues to advance if streaming is active.
+4. To keep only the final point marker pressed during each recording pause, enable `Keep only last marker during recording pause` in the script settings. This option is off by default. When enabled, a later point marker replaces the earlier paused marker's whole CSV row, including its stream timestamp; optional `(End)` hotkeys are unaffected.
 
 ## Tutorial on YouTube
 [![OBS Local Stream Marker tutorial! #obs](https://img.youtube.com/vi/kqZ8IEHLiYk/0.jpg)](https://www.youtube.com/watch?v=kqZ8IEHLiYk)

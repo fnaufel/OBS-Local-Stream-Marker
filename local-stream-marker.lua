@@ -18,6 +18,7 @@ local output_datetime_format			= "%Y-%m-%d";
 local use_custom_filename				= false;
 local reset_custom_filename				= true;
 local show_log							= false;
+local keep_only_last_paused_marker	= false;
 local comments_enabled					= false;
 local preset_file_extension				= ".markerpresets"
 
@@ -37,8 +38,11 @@ local recording_file_mark_end_timestamp = "n/a";
 local recording_file_elapsed_time_sec 	= 0
 local stream_start_time_csv				= "n/a";
 local stream_start_time 				= nil;
-local recording_start_time				= nil;
-local recording_file_start_time			= nil;
+local recording_start_time_ns			= nil;
+local recording_file_start_time_ns	= nil;
+local recording_pause_start_time_ns	= nil;
+local recording_paused_time_ns			= 0;
+local recording_file_paused_time_ns	= 0;
 
 -- hotkey stuff
 local marker_hotkey_id 					= obs.OBS_INVALID_HOTKEY_ID
@@ -48,6 +52,8 @@ local comments							= {}
 local comment_hotkey_ids				= {}
 local comment_end_hotkey_ids			= {}
 local open_markers						= {}
+local paused_marker_row_index			= nil
+local paused_marker_comment			= nil
 local active_comment					= ""
 local preset_filenames					= {}
 
@@ -72,6 +78,8 @@ local hotkey_end_pressed
 local mark_stream
 local mark_end_stream
 local on_event
+local on_recording_file_changed
+local recording_elapsed_times
 local update_ui_on_comments
 local update_ui_on_custom_filename
 local get_all_comment_preset_files
@@ -241,6 +249,17 @@ end
 
 
 -----== MARKERS SECTION ==-----
+recording_elapsed_times = function(now_ns)
+	local current_pause = 0
+	if recording_pause_start_time_ns ~= nil then
+		current_pause = now_ns - recording_pause_start_time_ns
+	end
+
+	return math.floor((now_ns - recording_start_time_ns - recording_paused_time_ns - current_pause) / 1000000000),
+		math.floor((now_ns - recording_file_start_time_ns - recording_file_paused_time_ns - current_pause) / 1000000000)
+end
+
+
 hotkey_pressed = function(index)
 	return function(pressed)
 		if not pressed then return end
@@ -287,8 +306,7 @@ mark_stream = function(active_comment)
 	if obs.obs_frontend_recording_active() then
 		-- double-check recording output
 		if recording_output ~= nil then
-			recording_elapsed_time_sec = os.time() - recording_start_time
-			recording_file_elapsed_time_sec = os.time() - recording_file_start_time
+			recording_elapsed_time_sec, recording_file_elapsed_time_sec = recording_elapsed_times(obs.os_gettime_ns())
 		end
 
 		-- get recording timestamp
@@ -321,15 +339,36 @@ mark_stream = function(active_comment)
 	-- get formatted variables into a line
 	local row = string_to_csv_row(output_format)
 
-	-- insert line into table and write to file
-	table.insert(lines, row)
+	-- replace the previous point marker from this pause when requested
+	local row_index
+	if keep_only_last_paused_marker and recording_pause_start_time_ns ~= nil and paused_marker_row_index ~= nil
+		and lines[paused_marker_row_index] ~= nil then
+		row_index = paused_marker_row_index
+		local previous_queue = open_markers[paused_marker_comment]
+		if previous_queue then
+			for i = #previous_queue, 1, -1 do
+				if previous_queue[i] == row_index then
+					table.remove(previous_queue, i)
+					break
+				end
+			end
+		end
+		lines[row_index] = row
+	else
+		table.insert(lines, row)
+		row_index = #lines
+	end
 	write_all_lines(output_path, lines)
 
     -- per-comment LIFO stack
     open_markers[active_comment] = open_markers[active_comment] or {}
-    table.insert(open_markers[active_comment], #lines)
+    table.insert(open_markers[active_comment], row_index)
+	if keep_only_last_paused_marker and recording_pause_start_time_ns ~= nil then
+		paused_marker_row_index = row_index
+		paused_marker_comment = active_comment
+	end
 
-	print_log("START '" .. tostring(active_comment) .. "' → row " .. #lines)
+	print_log("START '" .. tostring(active_comment) .. "' → row " .. row_index)
 	return true;
 end
 
@@ -353,8 +392,7 @@ mark_end_stream = function(active_comment)
 	if obs.obs_frontend_recording_active() then
 		-- double-check recording output
 		if recording_output ~= nil then
-			recording_elapsed_time_sec = os.time() - recording_start_time
-			recording_file_elapsed_time_sec = os.time() - recording_file_start_time
+			recording_elapsed_time_sec, recording_file_elapsed_time_sec = recording_elapsed_times(obs.os_gettime_ns())
 		end
 
 		-- get recording timestamp
@@ -399,6 +437,14 @@ mark_end_stream = function(active_comment)
 end
 
 
+on_recording_file_changed = function(calldata)
+	recording_path = obs.calldata_string(calldata, "next_file")
+	recording_filename = get_filename_from_path(recording_path)
+	recording_file_start_time_ns = obs.os_gettime_ns()
+	recording_file_paused_time_ns = 0
+end
+
+
 on_event = function(event)
 	if event == obs.OBS_FRONTEND_EVENT_STREAMING_STARTED then
 		stream_output = obs.obs_frontend_get_streaming_output();
@@ -413,8 +459,13 @@ on_event = function(event)
 	
 	if event == obs.OBS_FRONTEND_EVENT_RECORDING_STARTED then
 		recording_output = obs.obs_frontend_get_recording_output();
-		recording_file_start_time = os.time();
-		recording_start_time = os.time();
+		recording_start_time_ns = obs.os_gettime_ns();
+		recording_file_start_time_ns = recording_start_time_ns;
+		recording_pause_start_time_ns = nil;
+		recording_paused_time_ns = 0;
+		recording_file_paused_time_ns = 0;
+		paused_marker_row_index = nil;
+		paused_marker_comment = nil;
 		recording_timestamp = "00:00:00";
 		if not obs.obs_frontend_streaming_active() and not reset_custom_filename then
 			reset_custom_filename = true;
@@ -422,17 +473,39 @@ on_event = function(event)
 		print_log("Recording started: " .. os.date("%Y-%m-%d %X"));
 	end
 
+	if event == obs.OBS_FRONTEND_EVENT_RECORDING_PAUSED and recording_pause_start_time_ns == nil then
+		recording_pause_start_time_ns = obs.os_gettime_ns()
+		paused_marker_row_index = nil
+		paused_marker_comment = nil
+	end
+
+	if event == obs.OBS_FRONTEND_EVENT_RECORDING_UNPAUSED and recording_pause_start_time_ns ~= nil then
+		local pause_duration_ns = obs.os_gettime_ns() - recording_pause_start_time_ns
+		recording_paused_time_ns = recording_paused_time_ns + pause_duration_ns
+		recording_file_paused_time_ns = recording_file_paused_time_ns + pause_duration_ns
+		recording_pause_start_time_ns = nil
+		paused_marker_row_index = nil
+		paused_marker_comment = nil
+	end
+
 	if event == obs.OBS_FRONTEND_EVENT_STREAMING_STOPPED then
 		stream_output = nil
 	end
 
 	if event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED then
-		recording_output = nil
+		recording_pause_start_time_ns = nil
+		paused_marker_row_index = nil
+		paused_marker_comment = nil
 		recording_file_elapsed_time_sec = 0
-		obs.obs_data_release(output_settings)
-		obs.obs_output_release(recording_output)
-		obs.signal_handler_disconnect(signal_handler, "file_changed")
-	else
+		if signal_handler ~= nil then
+			obs.signal_handler_disconnect(signal_handler, "file_changed", on_recording_file_changed)
+			signal_handler = nil
+		end
+		if recording_output ~= nil then
+			obs.obs_output_release(recording_output)
+			recording_output = nil
+		end
+	elseif event == obs.OBS_FRONTEND_EVENT_RECORDING_STARTED then
 		-- check if recording was split, get new name and reset timestamp
 		-- credits to koala and upgradeQ in the OBS Forum for this (https://obsproject.com/forum/threads/failed-to-accomplish-work-with-lua-scripting.158774/)
 		if obs.obs_frontend_recording_active() then
@@ -457,12 +530,9 @@ on_event = function(event)
 				recording_path = obs.obs_data_get_string(output_settings, "url")
 			end
 			signal_handler = obs.obs_output_get_signal_handler(recording_output)
-			obs.signal_handler_connect(signal_handler, "file_changed", function(calldata)
-				recording_path = obs.calldata_string(calldata, "next_file")
-				recording_filename = get_filename_from_path(recording_path)
-				recording_file_start_time = os.time()
-			end)
+			obs.signal_handler_connect(signal_handler, "file_changed", on_recording_file_changed)
 			recording_filename = get_filename_from_path(recording_path)
+			obs.obs_data_release(output_settings)
 		end
 	end
 end
@@ -699,6 +769,8 @@ function script_properties()
 	update_ui_on_custom_filename(properties)
 
 	obs.obs_properties_add_bool(properties, "show_log", "Show debug log")
+	local paused_marker_property = obs.obs_properties_add_bool(properties, "keep_only_last_paused_marker", "Keep only last marker during recording pause")
+	obs.obs_property_set_long_description(paused_marker_property, "When several point-marker hotkeys are pressed during one recording pause, keep only the final marker. Earlier paused markers are removed from the CSV, including their stream timestamps.")
 
 	obs.obs_properties_add_text(properties, "spacer_1", " ", obs.OBS_TEXT_INFO)
 
@@ -742,6 +814,7 @@ function script_update(settings)
 	use_custom_filename = obs.obs_data_get_bool(settings, "use_custom_filename")
 	output_file_name_custom = obs.obs_data_get_string(settings, "output_file_name_custom")
 	show_log = obs.obs_data_get_bool(settings, "show_log")
+	keep_only_last_paused_marker = obs.obs_data_get_bool(settings, "keep_only_last_paused_marker")
 	output_datetime_format = obs.obs_data_get_string(settings, "output_datetime_format")
 
 	-- convert Windows path to UNIX path
@@ -766,6 +839,7 @@ function script_defaults(settings)
 	obs.obs_data_set_default_string(settings, "output_file_name_custom", output_file_name_custom)
 	obs.obs_data_set_default_bool(settings, "use_custom_filename", false)
 	obs.obs_data_set_default_bool(settings, "show_log", false)
+	obs.obs_data_set_default_bool(settings, "keep_only_last_paused_marker", false)
 	obs.obs_data_set_default_string(settings, "output_datetime_format", output_datetime_format)
 	obs.obs_data_set_default_bool(settings, "comments_enabled", false)
 end
